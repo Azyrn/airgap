@@ -86,6 +86,19 @@ The repository *is* the module — zip its contents with the module files at the
 zip -r9X airgap.zip . -x '.git/*' '.github/*'
 ```
 
+## Releasing
+
+Root managers poll `update.json` and offer an update only when its `versionCode` is **higher**
+than the installed one, so every release must bump it.
+
+1. Bump `version` and `versionCode` in `module.prop`
+2. Add the entry to `changelog.md`
+3. Update `version`, `versionCode` and `zipUrl` in `update.json` to match
+4. `zip -r9X airgap-<version>.zip . -x '.git/*' '.github/*'`
+5. `gh release create v<version> airgap-<version>.zip --title "Airgap <version>"`
+6. Push to the default branch — `update.json` is served from it, so the update only goes
+   live once pushed
+
 ## License
 
 [Apache-2.0](LICENSE)
