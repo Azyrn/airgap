@@ -80,10 +80,11 @@ deletes `/data/adb/airgap`.
 
 ## Building
 
-The repository *is* the module — zip its contents with the module files at the archive root:
+The repository *is* the module — zip its contents with the module files at the archive root,
+excluding the repo-only files that the module does not need at runtime:
 
 ```
-zip -r9X airgap.zip . -x '.git/*' '.github/*'
+zip -r9X airgap.zip . -x '.git/*' '.github/*' 'README.md' 'update.json' 'changelog.md'
 ```
 
 ## Releasing
@@ -94,7 +95,7 @@ than the installed one, so every release must bump it.
 1. Bump `version` and `versionCode` in `module.prop`
 2. Add the entry to `changelog.md`
 3. Update `version`, `versionCode` and `zipUrl` in `update.json` to match
-4. `zip -r9X airgap-<version>.zip . -x '.git/*' '.github/*'`
+4. `zip -r9X airgap-<version>.zip . -x '.git/*' '.github/*' 'README.md' 'update.json' 'changelog.md'`
 5. `gh release create v<version> airgap-<version>.zip --title "Airgap <version>"`
 6. Push to the default branch — `update.json` is served from it, so the update only goes
    live once pushed
