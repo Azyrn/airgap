@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+	<title>Airgap</title>
+	<link rel="stylesheet" href="app.css">
+</head>
+
+<body>
+	<header>
+		<div class="bar">
+			<h1>Airgap</h1>
+			<span id="count" class="count">…</span>
+			<button id="menu-btn" class="icon" aria-label="Menu">⋮</button>
+		</div>
+		<input id="search" type="search" placeholder="Search apps" autocomplete="off" spellcheck="false">
+		<div class="tabs" id="tabs">
+			<button data-filter="all" class="on">All</button>
+			<button data-filter="user">User</button>
+			<button data-filter="system">System</button>
+			<button data-filter="blocked">Blocked</button>
+		</div>
+		<div class="sortbar">
+			<select id="sort">
+				<option value="name">Name A → Z</option>
+				<option value="name-desc">Name Z → A</option>
+				<option value="blocked">Blocked first</option>
+				<option value="user-first">User apps first</option>
+				<option value="system-first">System apps first</option>
+				<option value="uid">UID</option>
+			</select>
+			<span id="shown" class="shown"></span>
+		</div>
+	</header>
+
+	<main id="list" aria-live="polite"></main>
+	<p id="empty" class="empty" hidden>No apps match this filter.</p>
+
+	<div id="menu" class="sheet" hidden>
+		<div class="sheet-body">
+			<button data-act="export">Export backup</button>
+			<button data-act="import">Import backup</button>
+			<button data-act="reapply">Re-apply rules</button>
+			<button data-act="unblock-all" class="danger">Unblock all apps</button>
+			<button data-act="status">Status</button>
+		</div>
+	</div>
+
+	<div id="modal" class="sheet" hidden>
+		<div class="sheet-body">
+			<h2 id="modal-title">Import backup</h2>
+			<div id="modal-content"></div>
+			<button data-act="close" class="ghost">Close</button>
+		</div>
+	</div>
+
+	<div id="toast" class="toast" hidden></div>
+
+	<template id="row">
+		<label class="row">
+			<span class="info">
+				<span class="pkg"><b></b><i class="tag">SYS</i></span>
+				<span class="sub"></span>
+			</span>
+			<input type="checkbox">
+			<span class="track"></span>
+		</label>
+	</template>
+
+	<script src="app.js"></script>
+</body>
+
+</html>

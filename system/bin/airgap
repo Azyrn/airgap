@@ -1,0 +1,517 @@
+#!/system/bin/sh
+# Airgap - per-app internet isolation engine
+
+DATADIR="${AG_DATADIR:-/data/adb/airgap}"
+PKGLIST="${AG_PKGLIST:-/data/system/packages.list}"
+PKGXML="${AG_PKGXML:-/data/system/packages.xml}"
+USERDIR="${AG_USERDIR:-/data/user}"
+IPT="${AG_IPTABLES:-iptables}"
+IPT6="${AG_IP6TABLES:-ip6tables}"
+PM="${AG_PM:-pm}"
+
+CONFIG="$DATADIR/isolated.json"
+BACKUPDIR="$DATADIR/backups"
+LOGFILE="$DATADIR/airgap.log"
+PIDFILE="$DATADIR/daemon.pid"
+WATCHFILE="$DATADIR/watcher.pid"
+CAPSFILE="$DATADIR/caps"
+TMPDIR="$DATADIR/tmp"
+LOCKDIR="$DATADIR/lock"
+CHAIN=airgap
+POLL_INTERVAL=60
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+log() {
+	[ -d "$DATADIR" ] || return 0
+	[ -f "$LOGFILE" ] && [ "$(wc -c <"$LOGFILE" 2>/dev/null || echo 0)" -gt 65536 ] && : >"$LOGFILE"
+	printf '[%s] %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >>"$LOGFILE"
+}
+
+die() {
+	printf 'Error: %s\n' "$*" >&2
+	exit 1
+}
+
+workdir() {
+	mkdir -p "$TMPDIR" 2>/dev/null
+	chmod 700 "$DATADIR" 2>/dev/null
+}
+
+# The watchdog, the WebUI and the CLI can all rebuild rules at once; a stale
+# lock is broken after 10s so a killed writer cannot wedge the module.
+acquire_lock() {
+	tries=0
+	while ! mkdir "$LOCKDIR" 2>/dev/null; do
+		tries=$((tries + 1))
+		[ "$tries" -ge 10 ] && { rm -rf "$LOCKDIR"; continue; }
+		sleep 1
+	done
+}
+
+release_lock() {
+	rmdir "$LOCKDIR" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- capabilities
+
+probe_caps() {
+	workdir
+	AG_WAIT=""
+	$IPT -w 5 -S OUTPUT >/dev/null 2>&1 && AG_WAIT="-w 5"
+
+	AG_TARGET=DROP
+	$IPT $AG_WAIT -N ag_probe >/dev/null 2>&1
+	$IPT $AG_WAIT -F ag_probe >/dev/null 2>&1
+	$IPT $AG_WAIT -A ag_probe -j REJECT >/dev/null 2>&1 && AG_TARGET=REJECT
+	$IPT $AG_WAIT -F ag_probe >/dev/null 2>&1
+	$IPT $AG_WAIT -X ag_probe >/dev/null 2>&1
+
+	AG_RESTORE=0
+	have "${IPT}-restore" && AG_RESTORE=1
+
+	printf 'AG_WAIT="%s"\nNS_TARGET=%s\nNS_RESTORE=%s\n' "$AG_WAIT" "$AG_TARGET" "$AG_RESTORE" >"$CAPSFILE"
+	log "capabilities: target=$AG_TARGET wait='$AG_WAIT' restore=$AG_RESTORE"
+}
+
+load_caps() {
+	[ -s "$CAPSFILE" ] && . "$CAPSFILE"
+	[ -n "$AG_TARGET" ] || { probe_caps; . "$CAPSFILE"; }
+}
+
+# --------------------------------------------------------------- config access
+
+config_read() {
+	[ -f "$CONFIG" ] || return 0
+	tr -d '[]"\r\t ' <"$CONFIG" | tr ',' '\n' | grep -v '^$'
+}
+
+config_write() {
+	workdir
+	awk '
+		NF {
+			gsub(/[^A-Za-z0-9._-]/, "")
+			if ($0 != "" && !seen[$0]++) list[++n] = $0
+		}
+		END {
+			printf "["
+			for (i = 1; i <= n; i++) printf "%s\"%s\"", (i > 1 ? "," : ""), list[i]
+			printf "]\n"
+		}
+	' >"$TMPDIR/config.new"
+	mv -f "$TMPDIR/config.new" "$CONFIG"
+	chmod 600 "$CONFIG" 2>/dev/null
+}
+
+installed_packages() {
+	[ -f "$PKGLIST" ] && awk '$1 != "" && $2 ~ /^[0-9]+$/ { print $1 }' "$PKGLIST"
+}
+
+system_packages() {
+	$PM list packages -s 2>/dev/null | sed -n 's/^package://p' | grep -v '^$' && return 0
+	[ -f "$PKGXML" ] && sed -n 's/.*<package name="\([^"]*\)".*codePath="\(\/system\|\/product\|\/vendor\|\/apex\|\/system_ext\)[^"]*".*/\1/p' "$PKGXML"
+}
+
+secondary_user_ids() {
+	ls "$USERDIR" 2>/dev/null | grep -E '^[0-9]+$' | grep -vx 0
+}
+
+# Resolves blocked packages to every UID they own, across all Android users.
+# Rebuilding the full set on each apply is what makes sharedUserId and
+# reinstall-changed UIDs correct by construction.
+resolve_uids() {
+	workdir
+	config_read | sort -u >"$TMPDIR/wanted"
+	[ -s "$TMPDIR/wanted" ] || return 0
+	[ -f "$PKGLIST" ] || return 0
+	secondary_user_ids >"$TMPDIR/users"
+
+	awk '
+		FILENAME ~ /wanted$/ { wanted[$0] = 1; next }
+		FILENAME ~ /users$/  { if ($0 + 0 > 0) users[++u] = $0 + 0; next }
+		wanted[$1] && $2 ~ /^[0-9]+$/ { base[$2] = 1 }
+		END {
+			for (b in base) {
+				print b + 0
+				for (i = 1; i <= u; i++) print b + users[i] * 100000
+			}
+		}
+	' "$TMPDIR/wanted" "$TMPDIR/users" "$PKGLIST" | sort -un
+}
+
+# ------------------------------------------------------------- ruleset control
+
+build_ruleset() {
+	printf '*filter\n:%s - [0:0]\n-F %s\n' "$CHAIN" "$CHAIN"
+	while read -r uid; do
+		[ -n "$uid" ] && printf -- '-A %s -m owner --uid-owner %s -j %s\n' "$CHAIN" "$uid" "$AG_TARGET"
+	done <"$TMPDIR/uids"
+	printf 'COMMIT\n'
+}
+
+apply_direct() {
+	bin="$1"
+	$bin $AG_WAIT -N "$CHAIN" >/dev/null 2>&1
+	$bin $AG_WAIT -F "$CHAIN" >/dev/null 2>&1
+	while read -r uid; do
+		[ -n "$uid" ] && $bin $AG_WAIT -A "$CHAIN" -m owner --uid-owner "$uid" -j "$AG_TARGET" >/dev/null 2>&1
+	done <"$TMPDIR/uids"
+}
+
+load_ruleset() {
+	bin="$1"
+	if [ "$AG_RESTORE" = 1 ] && have "${bin}-restore"; then
+		"${bin}-restore" $AG_WAIT -n <"$TMPDIR/rules" 2>>"$LOGFILE" && return 0
+		log "$bin-restore failed, falling back to direct rules"
+	fi
+	apply_direct "$bin"
+}
+
+# Keeps exactly one jump at the head of OUTPUT so our chain is evaluated
+# before netd's accept rules.
+ensure_hook() {
+	bin="$1"
+	hooks="$($bin $AG_WAIT -S OUTPUT 2>/dev/null | grep -c -- "-j $CHAIN$")"
+	[ -z "$hooks" ] && hooks=0
+	if [ "$hooks" -eq 0 ]; then
+		$bin $AG_WAIT -I OUTPUT 1 -j "$CHAIN" >/dev/null 2>&1
+	else
+		while [ "$hooks" -gt 1 ]; do
+			$bin $AG_WAIT -D OUTPUT -j "$CHAIN" >/dev/null 2>&1
+			hooks=$((hooks - 1))
+		done
+	fi
+}
+
+remove_hook() {
+	bin="$1"
+	while $bin $AG_WAIT -D OUTPUT -j "$CHAIN" >/dev/null 2>&1; do :; done
+	$bin $AG_WAIT -F "$CHAIN" >/dev/null 2>&1
+	$bin $AG_WAIT -X "$CHAIN" >/dev/null 2>&1
+}
+
+apply_rules() {
+	load_caps
+	workdir
+	acquire_lock
+	resolve_uids >"$TMPDIR/uids"
+	build_ruleset >"$TMPDIR/rules"
+	load_ruleset "$IPT"
+	load_ruleset "$IPT6"
+	ensure_hook "$IPT"
+	ensure_hook "$IPT6"
+	release_lock
+	log "applied $(wc -l <"$TMPDIR/uids") uid rule(s) from $(config_read | wc -l) package(s)${1:+ ($1)}"
+}
+
+clear_rules() {
+	load_caps
+	remove_hook "$IPT"
+	remove_hook "$IPT6"
+	log "rules cleared"
+}
+
+# ------------------------------------------------------------------ operations
+
+resolve_or_die() {
+	installed_packages | grep -qx "$1" || die "package '$1' is not installed"
+}
+
+cmd_block() {
+	[ $# -gt 0 ] || die "no package given. Try 'airgap help'."
+	for pkg in "$@"; do resolve_or_die "$pkg"; done
+	{ config_read; printf '%s\n' "$@"; } | config_write
+	apply_rules "block $*"
+	for pkg in "$@"; do printf 'Blocked %s\n' "$pkg"; done
+}
+
+cmd_unblock() {
+	[ $# -gt 0 ] || die "no package given. Try 'airgap help'."
+	if [ "$1" = "all" ]; then
+		: | config_write
+		apply_rules "unblock all"
+		echo "Unblocked all packages"
+		return 0
+	fi
+	workdir
+	printf '%s\n' "$@" | sort -u >"$TMPDIR/drop"
+	config_read | grep -vxF -f "$TMPDIR/drop" | config_write
+	apply_rules "unblock $*"
+	for pkg in "$@"; do printf 'Unblocked %s\n' "$pkg"; done
+}
+
+cmd_set() {
+	if [ "$1" = "--none" ] || [ $# -eq 0 ]; then
+		: | config_write
+	else
+		printf '%s\n' "$@" | config_write
+	fi
+	apply_rules "set"
+	printf 'Isolating %s package(s)\n' "$(config_read | wc -l)"
+}
+
+cmd_list() {
+	blocked="$(config_read)"
+	[ -z "$blocked" ] && { echo "No packages are isolated"; return 0; }
+	echo "Isolated packages:"
+	printf '%s\n' "$blocked" | while read -r pkg; do
+		uid="$(awk -v p="$pkg" '$1 == p { print $2; exit }' "$PKGLIST" 2>/dev/null)"
+		if [ -n "$uid" ]; then
+			printf -- '- %s (UID %s)\n' "$pkg" "$uid"
+		else
+			printf -- '- %s (not installed)\n' "$pkg"
+		fi
+	done
+}
+
+cmd_apps() {
+	workdir
+	config_read | sort -u >"$TMPDIR/blocked"
+	system_packages | sort -u >"$TMPDIR/system"
+	awk '
+		FILENAME ~ /blocked$/ { blocked[$0] = 1; next }
+		FILENAME ~ /system$/  { sys[$0] = 1; next }
+		$1 != "" && $2 ~ /^[0-9]+$/ && !seen[$1]++ {
+			printf "%s{\"p\":\"%s\",\"u\":%d,\"s\":%d,\"b\":%d}",
+				(n++ ? "," : "["), $1, $2, ($1 in sys), ($1 in blocked)
+		}
+		END { print (n ? "]" : "[]") }
+	' "$TMPDIR/blocked" "$TMPDIR/system" "$PKGLIST"
+}
+
+cmd_status() {
+	load_caps
+	workdir
+	resolve_uids >"$TMPDIR/uids"
+	if daemon_alive; then
+		watchdog="running (pid $(cat "$PIDFILE"))"
+	else
+		watchdog="stopped"
+	fi
+	printf 'isolated packages : %s\n' "$(config_read | wc -l)"
+	printf 'active uid rules  : v4=%s v6=%s (expected %s)\n' \
+		"$($IPT $AG_WAIT -S "$CHAIN" 2>/dev/null | grep -c -- '--uid-owner')" \
+		"$($IPT6 $AG_WAIT -S "$CHAIN" 2>/dev/null | grep -c -- '--uid-owner')" \
+		"$(wc -l <"$TMPDIR/uids")"
+	printf 'output hook       : v4=%s v6=%s\n' \
+		"$($IPT $AG_WAIT -S OUTPUT 2>/dev/null | grep -c -- "-j $CHAIN$")" \
+		"$($IPT6 $AG_WAIT -S OUTPUT 2>/dev/null | grep -c -- "-j $CHAIN$")"
+	printf 'reject target     : %s\n' "$AG_TARGET"
+	printf 'watchdog          : %s\n' "$watchdog"
+}
+
+# ---------------------------------------------------------------- backup files
+
+backup_packages() {
+	tr -d '\n\r' <"$1" | awk '
+		{
+			s = $0
+			i = index(s, "\"packages\"")
+			if (i > 0) s = substr(s, i)
+			j = index(s, "[")
+			if (j == 0) exit
+			s = substr(s, j + 1)
+			k = index(s, "]")
+			if (k > 0) s = substr(s, 1, k - 1)
+			n = split(s, a, ",")
+			for (i = 1; i <= n; i++) {
+				gsub(/[^A-Za-z0-9._-]/, "", a[i])
+				if (a[i] != "") print a[i]
+			}
+		}
+	'
+}
+
+cmd_backup() {
+	mkdir -p "$BACKUPDIR" 2>/dev/null
+	dest="$1"
+	if [ -z "$dest" ]; then
+		for dir in /sdcard/Download /storage/emulated/0/Download "$BACKUPDIR"; do
+			[ -d "$dir" ] && { dest="$dir/airgap-$(date '+%Y%m%d-%H%M%S').json"; break; }
+		done
+	fi
+	[ -n "$dest" ] || die "no writable backup location"
+
+	{
+		printf '{\n  "format": "airgap-backup",\n  "version": 1,\n'
+		printf '  "created": "%s",\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+		printf '  "device": "%s",\n' "$(getprop ro.product.model 2>/dev/null)"
+		printf '  "count": %s,\n' "$(config_read | wc -l)"
+		printf '  "packages": %s\n}\n' "$(cat "$CONFIG" 2>/dev/null || echo '[]')"
+	} >"$dest" || die "cannot write $dest"
+
+	chmod 644 "$dest" 2>/dev/null
+	printf '%s\n' "$dest"
+}
+
+cmd_restore() {
+	merge=0
+	file=""
+	for arg in "$@"; do
+		case "$arg" in
+		--merge) merge=1 ;;
+		--replace) merge=0 ;;
+		*) file="$arg" ;;
+		esac
+	done
+	[ -f "$file" ] || die "backup file not found: $file"
+	workdir
+	backup_packages "$file" | sort -u >"$TMPDIR/restore"
+	[ -s "$TMPDIR/restore" ] || die "no packages found in $file"
+
+	installed_packages | sort -u >"$TMPDIR/installed"
+	kept="$(comm -12 "$TMPDIR/restore" "$TMPDIR/installed")"
+	skipped="$(comm -23 "$TMPDIR/restore" "$TMPDIR/installed" | wc -l)"
+
+	if [ "$merge" = 1 ]; then
+		{ config_read; printf '%s\n' "$kept"; } | config_write
+	else
+		printf '%s\n' "$kept" | config_write
+	fi
+	apply_rules "restore"
+	printf 'Restored %s package(s), skipped %s not installed\n' "$(printf '%s\n' "$kept" | grep -c .)" "$skipped"
+}
+
+cmd_import_b64() {
+	[ -n "$1" ] || die "no data given"
+	workdir
+	printf '%s' "$1" | base64 -d >"$TMPDIR/import.json" 2>/dev/null || die "invalid base64 payload"
+	shift
+	cmd_restore "$TMPDIR/import.json" "$@"
+}
+
+cmd_backups() {
+	workdir
+	: >"$TMPDIR/found"
+	for dir in "$BACKUPDIR" /sdcard/Download /sdcard /storage/emulated/0/Download; do
+		[ -d "$dir" ] || continue
+		for file in "$dir"/airgap-*.json "$dir"/*airgap*.json; do
+			[ -f "$file" ] || continue
+			grep -qxF "$file" "$TMPDIR/found" && continue
+			printf '%s\n' "$file" >>"$TMPDIR/found"
+		done
+	done
+
+	first=1
+	printf '['
+	while read -r file; do
+		[ $first = 1 ] || printf ','
+		first=0
+		printf '{"path":"%s","name":"%s","when":"%s","count":%s}' \
+			"$file" "${file##*/}" \
+			"$(date -r "$file" '+%Y-%m-%d %H:%M' 2>/dev/null)" \
+			"$(backup_packages "$file" | grep -c .)"
+	done <"$TMPDIR/found"
+	printf ']\n'
+}
+
+# -------------------------------------------------------------------- watchdog
+
+daemon_alive() {
+	[ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+}
+
+# Reinstalling an app changes its UID, which would otherwise leave a stale rule
+# blocking nothing (or the wrong app).
+watch_packages() {
+	if have inotifyd; then
+		inotifyd - "${PKGLIST%/*}:ncwy" 2>/dev/null | while read -r _ _ file; do
+			case "$file" in
+			packages.list)
+				sleep 2
+				apply_rules "package change"
+				;;
+			esac
+		done
+		log "inotifyd watcher exited, using polling"
+	fi
+	last=""
+	while :; do
+		now="$(date -r "$PKGLIST" '+%s' 2>/dev/null)"
+		[ -n "$last" ] && [ "$now" != "$last" ] && apply_rules "package change"
+		last="$now"
+		sleep 15
+	done
+}
+
+# netd rebuilds the filter table on connectivity, VPN and tethering changes,
+# which silently drops rules that live in the built-in OUTPUT chain.
+integrity_check() {
+	load_caps
+	expected="$(resolve_uids | wc -l)"
+	active="$($IPT $AG_WAIT -S "$CHAIN" 2>/dev/null | grep -c -- '--uid-owner')"
+	hooked="$($IPT $AG_WAIT -S OUTPUT 2>/dev/null | grep -c -- "-j $CHAIN$")"
+	if [ "$active" != "$expected" ] || [ "$hooked" -lt 1 ]; then
+		apply_rules "integrity repair (had $active/$expected rules, $hooked hook)"
+	fi
+}
+
+stop_watcher() {
+	[ -f "$WATCHFILE" ] && kill "$(cat "$WATCHFILE")" 2>/dev/null
+	pkill -f "inotifyd - ${PKGLIST%/*}" 2>/dev/null
+	rm -f "$WATCHFILE"
+}
+
+cmd_daemon() {
+	daemon_alive && { echo "Watchdog already running"; return 0; }
+	workdir
+	echo $$ >"$PIDFILE"
+	trap 'stop_watcher; rm -f "$PIDFILE"; exit 0' INT TERM
+	log "watchdog started (pid $$)"
+	apply_rules "startup"
+	watch_packages &
+	echo $! >"$WATCHFILE"
+	while :; do
+		sleep "$POLL_INTERVAL"
+		integrity_check
+	done
+}
+
+cmd_stop() {
+	daemon_alive || { echo "Watchdog is not running"; return 0; }
+	stop_watcher
+	kill "$(cat "$PIDFILE")" 2>/dev/null
+	rm -f "$PIDFILE"
+	echo "Watchdog stopped"
+}
+
+usage() {
+	cat <<'EOF'
+Airgap - isolate apps from internet access
+
+Usage: airgap <command> [arguments]
+
+  block <pkg>...            isolate the given packages
+  unblock <pkg>...|all      restore internet access
+  set [<pkg>...|--none]     replace the isolated set with exactly these packages
+  list                      show isolated packages and their UIDs
+  apps                      list installed apps as JSON (used by the WebUI)
+  status                    show rule, hook and watchdog state
+  apply                     rebuild and reload all rules
+  clear                     remove every rule and unhook the chain
+  backup [file]             write a backup (default: /sdcard/Download)
+  backups                   list discoverable backups as JSON
+  restore <file> [--merge]  restore from a backup file
+  daemon | stop             control the resync watchdog
+EOF
+}
+
+case "$1" in
+block) shift; cmd_block "$@" ;;
+unblock) shift; cmd_unblock "$@" ;;
+set) shift; cmd_set "$@" ;;
+list) cmd_list ;;
+apps) cmd_apps ;;
+status) cmd_status ;;
+apply) apply_rules "manual"; echo "Rules reloaded" ;;
+clear) clear_rules; echo "Rules cleared" ;;
+backup) shift; cmd_backup "$@" ;;
+backups) cmd_backups ;;
+restore) shift; cmd_restore "$@" ;;
+import-b64) shift; cmd_import_b64 "$@" ;;
+daemon) cmd_daemon ;;
+stop) cmd_stop ;;
+probe) probe_caps; cat "$CAPSFILE" ;;
+help | -h | --help) usage ;;
+*) usage; exit 1 ;;
+esac

@@ -1,0 +1,6 @@
+id=airgap
+name=Airgap
+version=1.0
+versionCode=1
+author=skeler
+description=Cut internet access per app. Dedicated iptables chain, resync watchdog, system/user filtering and backup-restore.
