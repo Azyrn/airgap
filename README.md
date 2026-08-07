@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/banner.jpg" alt="Airgap — cut the internet, app by app" width="800"></p>
+
 # Airgap
 
 Cut internet access per app, on rooted Android. Magisk / KernelSU / APatch module.
@@ -84,7 +86,7 @@ The repository *is* the module — zip its contents with the module files at the
 excluding the repo-only files that the module does not need at runtime:
 
 ```
-zip -r9X airgap.zip . -x '.git/*' '.github/*' 'README.md' 'update.json' 'changelog.md'
+zip -r9X airgap.zip . -x '.git/*' '.github/*' 'assets/*' 'README.md' 'update.json' 'changelog.md'
 ```
 
 ## Releasing
@@ -95,7 +97,7 @@ than the installed one, so every release must bump it.
 1. Bump `version` and `versionCode` in `module.prop`
 2. Add the entry to `changelog.md`
 3. Update `version`, `versionCode` and `zipUrl` in `update.json` to match
-4. `zip -r9X airgap-<version>.zip . -x '.git/*' '.github/*' 'README.md' 'update.json' 'changelog.md'`
+4. `zip -r9X airgap-<version>.zip . -x '.git/*' '.github/*' 'assets/*' 'README.md' 'update.json' 'changelog.md'`
 5. `gh release create v<version> airgap-<version>.zip --title "Airgap <version>"`
 6. Push to the default branch — `update.json` is served from it, so the update only goes
    live once pushed
